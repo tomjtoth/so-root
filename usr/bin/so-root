@@ -1,0 +1,243 @@
+#!/usr/bin/bash
+
+
+config_file=/etc/so-root.conf
+
+
+# pushing updates to the test image
+case "$1" in
+  *qcow2 )
+    case "$2" in
+      mount )
+        sudo modprobe nbd max_part=16
+        sudo qemu-nbd -c /dev/nbd0 "$1"
+        sudo partprobe /dev/nbd0
+        sudo mount /dev/nbd0p2 /mnt
+        sudo mount /dev/nbd0p1 /mnt/boot
+      ;;
+      
+      copy )
+        sudo cp -a ~/soft-hard-ware/linux/bin-private/projects/so-root/* /mnt
+      ;;
+      
+      umount )
+        sudo umount /mnt/boot
+        sudo umount /mnt
+        sudo qemu-nbd -d /dev/nbd0
+      ;;
+      
+      qemu )
+        #CDROM="-cdrom /home/downloads/archlinux-2020.10.01-x86_64.iso -boot order=d"
+        qemu-system-x86_64 -enable-kvm -cpu host -m 1G -hda "$1" $CDROM
+      ;;
+    esac
+    exit 0
+  ;;
+  
+  *conf )
+    [ -f "$1" ] && config_file="$1"
+  ;;
+esac
+
+
+[ -f $config_file ] && source $config_file
+
+
+# the images folder should be moved to a tmpfs somehow sometime, due to lz4 compression on an already compressed zram device (in case of ramroot) (?)
+move_images() {
+  
+  #mv $DIR_IMAGES/* 
+  return 0
+}
+
+
+mount_images() {
+  # renaming images if necessary
+  if [ -f "$DIR_IMAGES/.images_to_rename" ]; then
+    for line in $(cat "$DIR_IMAGES/.images_to_rename"); do
+      SRC=$(echo $line | grep -Po '^.+(?=\.{10})')
+      DST=$(echo $line | grep -Po '(?<=\.{10}).+$')
+      if [ -f "$SRC" ] && [ ! -e "$DST" ]; then
+        mv "$SRC" "$DST"
+      fi
+    done
+    rm "$DIR_IMAGES/.images_to_rename"
+  fi
+  
+  for image in $(ls "$DIR_IMAGES" | grep -P 'sfs'); do
+    if ! $(mountpoint -q "$DIR_MOUNTS/${image%.sfs}"); then 
+      
+      # skipping checking the seed if it's blacklisted
+      if [ -n "$seeds_blacklisted" ]; then
+        for (( i=0; i<${#seeds_blacklisted[@]}; i++ )); do
+          if $(echo $image | grep -Pq ${seeds_blacklisted[$i]}); then
+            continue 2
+          fi
+        done
+      fi
+      
+      # checking for multiple seeds of this image
+      if $(echo $image | grep -Pq '(?<=-)0+\.sfs'); then
+        seeds_available=($(ls "$DIR_IMAGES" | grep -Po "${image%%-*.sfs}"'.+0+\.sfs'))
+        if [ "${#seeds_available[@]}" -gt 1 ]; then
+          echo -e "${image%%-*.sfs} has multiple seeds as seen below\nchoose one branch to load:\n"
+          for (( i=0; i<${#seeds_available[@]}; i++ )); do
+            echo "$i - ${seeds_available[$i]} - created at: $(stat $DIR_IMAGES/${seeds_available[$i]} | grep -Po '(?<=Birth: ).+')"
+          done
+          # choosing the branch of seed to use
+          while [ : ]; do
+            read seed</dev/tty
+            re='^[0-9]+$'
+            # defaulting to the last one
+            [ -z $seed ] && seed=$(( ${#seeds_available[@]} - 1 ))
+            if ! [[ $seed =~ $re ]] || [ "$seed" -lt 0 ] || [ "$seed" -gt "$(( ${#seeds_available[@]} - 1 ))" ] ; then
+              echo "not a valid choice"
+            else
+              # blacklist all images containing the non-selected seeds
+              for (( i=0; i<${#seeds_available[@]}; i++ )); do
+                [ "$i" -eq "$seed" ] && continue
+                seeds_blacklisted+=($(echo "${seeds_available[$i]}" | grep -Po '.+(?=-\d+\.sfs)'))
+                #echo "### these are the currently blacklisted seeds: ${seeds_blacklisted[@]}"
+                image=${seeds_available[$seed]}
+                #echo $image
+              done
+              break
+            fi
+          done
+        fi
+      fi
+      
+      [ ! -d "$DIR_MOUNTS/${image%.sfs}" ] && mkdir -p "$DIR_MOUNTS/${image%.sfs}"
+      # check if ran during early userspace
+      mount -t squashfs -o loop,ro "$DIR_IMAGES/$image" "$DIR_MOUNTS/${image%.sfs}"
+      if [ $? -ne 0 ]; then
+        echo "error handling should come here"
+      fi
+    fi
+  done
+  unset seeds_blacklisted
+}
+
+
+umount_images() {
+  for mount in $(df | grep -Po '^/dev/loop.+'"$DIR_MOUNTS"'\K.+$'); do
+    if $(mountpoint -q "$DIR_MOUNTS/$mount"); then 
+      umount "$DIR_MOUNTS/$mount"
+      if [ $? -ne 0 ]; then
+        echo "error handling should come here"
+      fi
+    fi
+  done
+}
+
+
+mount_overlays() {
+  for mount in $(ls "$DIR_MOUNTS" | grep -P '\w+-\d+-0+'); do
+    [ ! -d "$DIR_MOUNTS/${mount%%-*}-work" ] && mkdir -p "$DIR_MOUNTS/${mount%%-*}-work"
+    [ ! -d "$DIR_MOUNTS/${mount%%-*}-upper" ] && mkdir -p "$DIR_MOUNTS/${mount%%-*}-upper"
+    [ ! -d "$DIR_DESTINATION/${mount%%-*}" ] && mkdir -p "$DIR_DESTINATION/${mount%%-*}"
+    if ! $(mountpoint -q "$DIR_DESTINATION/${mount%%-*}"); then 
+      lowers=$(ls "$DIR_MOUNTS" | grep -P ${mount%%-*}'(-\d+)+$' | sort -r | xargs | sed 's, ,'":$DIR_MOUNTS/"',g')
+      mount -t overlay overlay -o lowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS/${mount%%-*}-upper,workdir=$DIR_MOUNTS/${mount%%-*}-work $DIR_DESTINATION/${mount%%-*}
+      if [ $? -ne 0 ]; then
+        echo "error handling should come here"
+      fi
+    fi
+  done
+}
+
+
+umount_overlays() {
+  for mount in $(df | grep -Po '^overlay.+'"$DIR_DESTINATION"'/\K.+$'); do
+    #if [ $(ls -A "$DIR_MOUNTS/${mount}-upper") ]; then
+      echo -e "you have unsaved changes in $mount\nyou can:\n - create a new Incremental image\n - or Seed image\n - or Delete the changes\n\nwhat will it be? [i/s/D]"
+      read saving </dev/tty
+      case "$saving" in
+        [iI]* )
+          echo -e "\n### creating an Incremental image\n"
+          create_new_image "$DIR_MOUNTS/${mount}-upper"
+        ;;
+        
+        [sSrR]* )
+          echo -e "\n### creating a Seed image\n"
+          create_new_image "$DIR_DESTINATION/$mount"
+        ;;
+        
+        *)
+          echo -e "\n### proceeding without creating a new image\n"
+        ;;
+      esac
+    #fi
+    umount "$DIR_DESTINATION/$mount"
+    if [ $? -ne 0 ]; then
+      echo "error handling should come here"
+    fi
+    #[ -d "$DIR_DESTINATION/$mount" ] && rm -rf "$DIR_DESTINATION/$mount"
+    [ -d "$DIR_MOUNTS/${mount}-upper" ] && rm -rf "$DIR_MOUNTS/${mount}-upper)"
+    [ -d "$DIR_MOUNTS/${mount}-work" ] && rm -rf "$DIR_MOUNTS/${mount}-work"
+  done
+}
+
+
+create_new_image() {
+  required_space=$(( $(du -cs "$1" | grep -Po '^\d+' | tail -n 1) / 2 ))
+  [ ! -d "$DIR_MOUNTS/persistent" ] && mkdir -p "$DIR_MOUNTS/persistent"
+  if ! $(mountpoint -q "$DIR_MOUNTS/persistent"); then
+    echo 'mount $DEV_PERSISTENT $DIR_MOUNTS/persistent'
+  fi
+  [ ! -d "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}" ] && mkdir -p "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}"
+  free_space=$(df "$DIR_MOUNTS/persistent" | tail -n 1 | awk '{print $4}')
+  echo -e "required space: ${required_space}\nfree space: $free_space"
+  if [ "$free_space" -le "$required_space" ]; then
+    echo -e "there is not enough space to create an image of $1\ndeleting the changes"
+    return
+  fi
+  LAST_ITERATION=$(ls $DIR_IMAGES | grep -Po $mount'-\K\d+-\d+(?=\.sfs)' | tail -n 1)
+  CURRENT_ITERATION=$(ls $DIR_MOUNTS | grep -Po $mount'-\K\d+-\d+' | tail -n 1)
+  if [[ "$1" == *upper ]]; then
+    OLD_X=${CURRENT_ITERATION%%-*}
+    OLD_Y=${CURRENT_ITERATION##*-}
+    NEW_X=$OLD_X
+    NEW_Y=$(( $OLD_Y + 1))
+  else
+    OLD_X=${LAST_ITERATION%%-*}
+    OLD_Y=${LAST_ITERATION##*-}
+    NEW_X=$(( $OLD_X +1 ))
+    NEW_Y=0
+  fi
+  NEW_ITERATION=$NEW_X-$NEW_Y
+  
+  #new seed
+  if [ ${#NEW_X} -gt ${#OLD_X} ]; then
+    for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
+      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+-\d+\.sfs)')0$(echo $image | grep -Po '\d+-\d+\.sfs')" >> "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/.images_to_rename"
+    done
+  fi
+  
+  #new increment
+  if [ ${#NEW_Y} -gt ${#OLD_Y} ]; then
+    for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
+      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+\.sfs)')0$(echo $image | grep -Po '\d+\.sfs')" >> "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/.images_to_rename"
+    done
+  fi
+  mksquashfs $1 $DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/${mount}-${NEW_ITERATION}.sfs $SQUASH_FLAGS
+  if [ $? -ne 0 ]; then 
+    echo "error handling should come here"
+  fi
+}
+
+
+#actually running the script
+
+
+# to work in early userspace
+if [ -d /new_root ]; then
+  DIR_IMAGES=/new_root$DIR_IMAGES
+  DIR_MOUNTS=/new_root$DIR_MOUNTS
+  DIR_DESTINATION=/new_root$DIR_DESTINATION
+fi
+
+
+mount_images
+mount_overlays
+

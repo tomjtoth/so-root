@@ -1,0 +1,7 @@
+#!/usr/bin/ash
+
+
+run_latehook() {
+  /usr/bin/bash /usr/bin/so-root
+}
+
