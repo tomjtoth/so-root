@@ -17,7 +17,22 @@ inspired by ramroot while waiting for the thousands of files (from ncdu: Items: 
  
 # worked, might be broken currently:
  - creation of incremental and seed images require a systemd service to kick in during poweroff and be able to quistionnaire the user
- 
+
+# how to try it:
+ - create manually the squashed images-0-0.sfs under your DIR_IMAGES
+ - make a test-run:
+    - set DIR_DESTINATION of something else than "/"
+    - include so-root in your HOOKS (I use the last place it's a late_hook anyways)
+    - run 'mkinitcpio -P'
+    - reboot
+    - verify with 'mount', lower,upper,workdirs include '/new_root' in their path, but they do function properly
+ - do it for real
+    - edit the DIR_DESTIONATION to "/"
+    - run 'mkinitcpio -P'
+    - poweroff
+    - mount your "/" partition on a different host and delete /whatever_folders_you_want_to_substitute 
+    - poweron
+
 # todo:
  - re-write in /bin/ash (I currently have 0 XP in it, so I bring /bin/bash to initarmfs as well)
  - split the script into so-root-load and so-root-unload parts, so unloading wouldn't have to be brought to initramfs
