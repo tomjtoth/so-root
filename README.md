@@ -12,7 +12,7 @@ inspired by ramroot while waiting for the thousands of files (from ncdu: Items: 
  - $1 can be "/path/to/custom/*.conf" - sourcing that instead of the default config file
  - $1 can be "/path/to/something.qcow2" - 
     - mount - mounting my 2 partitions from the qcow2 image at /mnt
-    - copy - pushing updates to the image
+    - update - pushing updates to the image
     - umount - unmounting /mnt
  
 # worked, might be broken currently:
@@ -34,8 +34,6 @@ inspired by ramroot while waiting for the thousands of files (from ncdu: Items: 
     - poweron
 
 # todo:
- - re-write in /bin/ash (I currently have 0 XP in it, so I bring /bin/bash to initarmfs as well)
- - split the script into so-root-load and so-root-unload parts, so unloading wouldn't have to be brought to initramfs
  - create systemd unit for shutdown routines (umount_overlays(create_new_image), umount_images)
  - automate image creation (currently doing it manually, offline)
  - come up with revert solution (haven't tried yet)
