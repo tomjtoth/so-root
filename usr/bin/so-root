@@ -1,10 +1,7 @@
-#!/usr/bin/bash
+#!/bin/bash
 
 
-config_file=/etc/so-root.conf
-
-
-# pushing updates to the test image
+# required for development
 case "$1" in
   *qcow2 )
     case "$2" in
@@ -16,8 +13,9 @@ case "$1" in
         sudo mount /dev/nbd0p1 /mnt/boot
       ;;
       
-      copy )
+      update )
         sudo cp -a ~/soft-hard-ware/linux/bin-private/projects/so-root/* /mnt
+        #sudo arch-chroot /mnt /bin/bash -c "mkinitcpio -P && exit" #this one actually makes the image unbootable for some reason...
       ;;
       
       umount )
@@ -27,8 +25,12 @@ case "$1" in
       ;;
       
       qemu )
+        #GPU="-vga virtio"
+        #GPU="-vga virtio -display gtk,gl=on"
+        GPU="-vga virtio -display gtk,gl=on vga=0x305"
+        #MOUSE="-usb -device usb-tablet -show-cursor"
         #CDROM="-cdrom /home/downloads/archlinux-2020.10.01-x86_64.iso -boot order=d"
-        qemu-system-x86_64 -enable-kvm -cpu host -m 1G -hda "$1" $CDROM
+        qemu-system-x86_64 -enable-kvm -cpu host -m 4G -hda "$1" $CDROM $GPU
       ;;
     esac
     exit 0
@@ -40,14 +42,63 @@ case "$1" in
 esac
 
 
-[ -f $config_file ] && source $config_file
+# if run during boot
+[ -f /init ] && [ -d /new_root ] && EARLY_USERSPACE=/new_root && PATH="/new_root/usr/bin:$PATH" && export LD_LIBRARY_PATH="/new_root/usr/lib"
+config_file=/etc/so-root.conf
 
 
-# the images folder should be moved to a tmpfs somehow sometime, due to lz4 compression on an already compressed zram device (in case of ramroot) (?)
-move_images() {
-  
-  #mv $DIR_IMAGES/* 
-  return 0
+# getting config
+source $EARLY_USERSPACE$config_file
+source $EARLY_USERSPACE/usr/lib/so-root/*
+DIR_IMAGES=$EARLY_USERSPACE$DIR_IMAGES
+DIR_MOUNTS=$EARLY_USERSPACE$DIR_MOUNTS
+DIR_DESTINATION=$EARLY_USERSPACE$DIR_DESTINATION
+
+
+check_available_RAM() {
+  # values in kB except min_system_RAM
+  available_ram=$(free | grep -P 'Mem' | awk '{print $7}')
+  size_of_images=$(du -s $DIR_IMAGES | awk '{print $1}')
+  if [ "$(( $zram_size + $size_of_images * 2 + $min_system_RAM * 1024 ))" -lt "$available_ram" ]; then
+    echo -n "do you want to copy all the images to RAM? [y/N] "
+    read answer #</dev/tty
+    case "$answer" in
+      y|Y*)
+        if ! [[ $(mount /new_root 2>/dev/null | awk '{print $1}') == *zram* ]]; then
+          # create zram to catch changes made to folders
+          insert_module zram lz4 ext4
+          zram_device=$(zramctl -f -s $(( $zram_size * 1024 * 1024 )) -a lz4)
+          DIR_MOUNTS_ZRAM=/.zram
+          mkfs.ext4 -q $zram_device
+          create_dir "$DIR_MOUNTS/.zram"
+          mount $zram_device "$DIR_MOUNTS/.zram"
+        fi
+        
+        # create tmpfs for already compressed images
+        create_dir "$DIR_MOUNTS/.tmpfs"
+        size_of_images=$(( $(( $size_of_images + 5 * 1024 )) * 1024 ))
+        mount -t tmpfs tmpfs -o size=$size_of_images "$DIR_MOUNTS/.tmpfs"
+        cp $DIR_IMAGES/* $DIR_MOUNTS/.tmpfs
+        DIR_IMAGES="$DIR_MOUNTS/.tmpfs"
+      ;;
+    esac
+  fi
+}
+
+
+create_dir() {
+  [ -d "$1" ] && rm -rf "$1"
+  mkdir -p "$1"
+}
+
+
+insert_module() {
+  for module in $@; do
+    echo "inserting kernel module now: $module"
+    if [ ! $(lsmod | grep -q $module) ]; then
+      insmod $(find /new_root/usr/lib/modules/$(uname -r) -name ${module}'.ko.xz') 2>/dev/null
+    fi
+  done
 }
 
 
@@ -58,7 +109,7 @@ mount_images() {
       SRC=$(echo $line | grep -Po '^.+(?=\.{10})')
       DST=$(echo $line | grep -Po '(?<=\.{10}).+$')
       if [ -f "$SRC" ] && [ ! -e "$DST" ]; then
-        mv "$SRC" "$DST"
+        mv "$EARLY_USERSPACE$SRC" "$EARLY_USERSPACE$DST"
       fi
     done
     rm "$DIR_IMAGES/.images_to_rename"
@@ -86,11 +137,11 @@ mount_images() {
           done
           # choosing the branch of seed to use
           while [ : ]; do
-            read seed</dev/tty
-            re='^[0-9]+$'
+            read seed #</dev/tty
+            regex='^[0-9]+$'
             # defaulting to the last one
             [ -z $seed ] && seed=$(( ${#seeds_available[@]} - 1 ))
-            if ! [[ $seed =~ $re ]] || [ "$seed" -lt 0 ] || [ "$seed" -gt "$(( ${#seeds_available[@]} - 1 ))" ] ; then
+            if ! [[ $seed =~ $regex ]] || [ "$seed" -lt 0 ] || [ "$seed" -gt "$(( ${#seeds_available[@]} - 1 ))" ] ; then
               echo "not a valid choice"
             else
               # blacklist all images containing the non-selected seeds
@@ -107,8 +158,8 @@ mount_images() {
         fi
       fi
       
-      [ ! -d "$DIR_MOUNTS/${image%.sfs}" ] && mkdir -p "$DIR_MOUNTS/${image%.sfs}"
-      # check if ran during early userspace
+      create_dir "$DIR_MOUNTS/${image%.sfs}"
+      insert_module loop squashfs
       mount -t squashfs -o loop,ro "$DIR_IMAGES/$image" "$DIR_MOUNTS/${image%.sfs}"
       if [ $? -ne 0 ]; then
         echo "error handling should come here"
@@ -116,6 +167,23 @@ mount_images() {
     fi
   done
   unset seeds_blacklisted
+}
+
+
+mount_overlays() {
+  for mount in $(ls "$DIR_MOUNTS" | grep -P '\w+-\d+-0+'); do
+    create_dir "$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-work"
+    create_dir "$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-upper"
+    create_dir "$DIR_DESTINATION/${mount%%-*}"
+    if ! $(mountpoint -q "$DIR_DESTINATION/${mount%%-*}"); then 
+      lowers=$(ls "$DIR_MOUNTS" | grep -P ${mount%%-*}'(-\d+)+$' | sort -r | xargs | sed 's, ,'":$DIR_MOUNTS/"',g')
+      insert_module overlay
+      mount -t overlay overlay -o lowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-work $DIR_DESTINATION/${mount%%-*}
+      if [ $? -ne 0 ]; then
+        echo "error handling should come here"
+      fi
+    fi
+  done
 }
 
 
@@ -131,27 +199,11 @@ umount_images() {
 }
 
 
-mount_overlays() {
-  for mount in $(ls "$DIR_MOUNTS" | grep -P '\w+-\d+-0+'); do
-    [ ! -d "$DIR_MOUNTS/${mount%%-*}-work" ] && mkdir -p "$DIR_MOUNTS/${mount%%-*}-work"
-    [ ! -d "$DIR_MOUNTS/${mount%%-*}-upper" ] && mkdir -p "$DIR_MOUNTS/${mount%%-*}-upper"
-    [ ! -d "$DIR_DESTINATION/${mount%%-*}" ] && mkdir -p "$DIR_DESTINATION/${mount%%-*}"
-    if ! $(mountpoint -q "$DIR_DESTINATION/${mount%%-*}"); then 
-      lowers=$(ls "$DIR_MOUNTS" | grep -P ${mount%%-*}'(-\d+)+$' | sort -r | xargs | sed 's, ,'":$DIR_MOUNTS/"',g')
-      mount -t overlay overlay -o lowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS/${mount%%-*}-upper,workdir=$DIR_MOUNTS/${mount%%-*}-work $DIR_DESTINATION/${mount%%-*}
-      if [ $? -ne 0 ]; then
-        echo "error handling should come here"
-      fi
-    fi
-  done
-}
-
-
 umount_overlays() {
   for mount in $(df | grep -Po '^overlay.+'"$DIR_DESTINATION"'/\K.+$'); do
     #if [ $(ls -A "$DIR_MOUNTS/${mount}-upper") ]; then
       echo -e "you have unsaved changes in $mount\nyou can:\n - create a new Incremental image\n - or Seed image\n - or Delete the changes\n\nwhat will it be? [i/s/D]"
-      read saving </dev/tty
+      read saving #</dev/tty
       case "$saving" in
         [iI]* )
           echo -e "\n### creating an Incremental image\n"
@@ -180,10 +232,10 @@ umount_overlays() {
 
 
 create_new_image() {
-  required_space=$(( $(du -cs "$1" | grep -Po '^\d+' | tail -n 1) / 2 ))
+  required_space=$(( $(du -s "$1" | grep -Po '^\d+') / 2 ))
   [ ! -d "$DIR_MOUNTS/persistent" ] && mkdir -p "$DIR_MOUNTS/persistent"
   if ! $(mountpoint -q "$DIR_MOUNTS/persistent"); then
-    echo 'mount $DEV_PERSISTENT $DIR_MOUNTS/persistent'
+    echo 'mount $DEV_PERSISTENT $DIR_MOUNTS/persistent' #still testing
   fi
   [ ! -d "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}" ] && mkdir -p "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}"
   free_space=$(df "$DIR_MOUNTS/persistent" | tail -n 1 | awk '{print $4}')
@@ -227,17 +279,6 @@ create_new_image() {
 }
 
 
-#actually running the script
-
-
-# to work in early userspace
-if [ -d /new_root ]; then
-  DIR_IMAGES=/new_root$DIR_IMAGES
-  DIR_MOUNTS=/new_root$DIR_MOUNTS
-  DIR_DESTINATION=/new_root$DIR_DESTINATION
-fi
-
-
-mount_images
-mount_overlays
+# if run during boot
+[ -n $EARLY_USERSPACE ] && check_available_RAM && mount_images && mount_overlays
 

@@ -2,15 +2,7 @@
 
 
 build() {
-    add_binary bash
-    add_binary xargs
-    add_binary so-root
-    add_binary grep
-    add_file /etc/so-root.conf
     add_runscript
-    add_module overlay
-    add_module squashfs
-    add_module loop
 }
 
 
