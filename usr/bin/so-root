@@ -25,9 +25,9 @@ case "$1" in
       ;;
       
       qemu )
-        #GPU="-vga virtio"
+        GPU="-vga virtio"
         #GPU="-vga virtio -display gtk,gl=on"
-        GPU="-vga virtio -display gtk,gl=on vga=0x305"
+        #GPU="-vga virtio -display gtk,gl=on vga=0x305"
         #MOUSE="-usb -device usb-tablet -show-cursor"
         #CDROM="-cdrom /home/downloads/archlinux-2020.10.01-x86_64.iso -boot order=d"
         qemu-system-x86_64 -enable-kvm -cpu host -m 4G -hda "$1" $CDROM $GPU
@@ -39,6 +39,10 @@ case "$1" in
   *conf )
     [ -f "$1" ] && config_file="$1"
   ;;
+  
+  verbosity=*)
+    verbosity=${1##*=}
+  ;;
 esac
 
 
@@ -49,7 +53,6 @@ config_file=/etc/so-root.conf
 
 # getting config
 source $EARLY_USERSPACE$config_file
-source $EARLY_USERSPACE/usr/lib/so-root/*
 DIR_IMAGES=$EARLY_USERSPACE$DIR_IMAGES
 DIR_MOUNTS=$EARLY_USERSPACE$DIR_MOUNTS
 DIR_DESTINATION=$EARLY_USERSPACE$DIR_DESTINATION
@@ -66,12 +69,15 @@ check_available_RAM() {
       y|Y*)
         if ! [[ $(mount /new_root 2>/dev/null | awk '{print $1}') == *zram* ]]; then
           # create zram to catch changes made to folders
-          insert_module zram lz4 ext4
+          insert_module zram ext4
           zram_device=$(zramctl -f -s $(( $zram_size * 1024 * 1024 )) -a lz4)
+          [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo "successfully created $zram_device"
           DIR_MOUNTS_ZRAM=/.zram
           mkfs.ext4 -q $zram_device
+          [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo "successfully formatted $zram_device"
           create_dir "$DIR_MOUNTS/.zram"
           mount $zram_device "$DIR_MOUNTS/.zram"
+          [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo "successfully mounted $zram_device"
         fi
         
         # create tmpfs for already compressed images
@@ -89,14 +95,15 @@ check_available_RAM() {
 create_dir() {
   [ -d "$1" ] && rm -rf "$1"
   mkdir -p "$1"
+  [ $? -eq 0 ] && [ "$verbosity" -ge "3" ] && echo "successfully created directory $1"
 }
 
 
 insert_module() {
   for module in $@; do
-    echo "inserting kernel module now: $module"
-    if [ ! $(lsmod | grep -q $module) ]; then
-      insmod $(find /new_root/usr/lib/modules/$(uname -r) -name ${module}'.ko.xz') 2>/dev/null
+    if ! $(lsmod | grep -q $module); then
+      insmod $(find /new_root/usr/lib/modules/$(uname -r) -name ${module}'.ko.xz') #2>/dev/null
+      [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo "successfully inserted kernel module $module"
     fi
   done
 }
@@ -110,6 +117,7 @@ mount_images() {
       DST=$(echo $line | grep -Po '(?<=\.{10}).+$')
       if [ -f "$SRC" ] && [ ! -e "$DST" ]; then
         mv "$EARLY_USERSPACE$SRC" "$EARLY_USERSPACE$DST"
+        [ $? -eq 0 ] && [ "$verbosity" -ge "4" ] && echo -e "successfully renamed \"$EARLY_USERSPACE$SRC\" to \"$EARLY_USERSPACE$DST\""
       fi
     done
     rm "$DIR_IMAGES/.images_to_rename"
@@ -148,9 +156,8 @@ mount_images() {
               for (( i=0; i<${#seeds_available[@]}; i++ )); do
                 [ "$i" -eq "$seed" ] && continue
                 seeds_blacklisted+=($(echo "${seeds_available[$i]}" | grep -Po '.+(?=-\d+\.sfs)'))
-                #echo "### these are the currently blacklisted seeds: ${seeds_blacklisted[@]}"
+                [ "$verbosity" -ge "5" ] && echo -e "### these are the currently blacklisted seeds:\n${seeds_blacklisted[@]}"
                 image=${seeds_available[$seed]}
-                #echo $image
               done
               break
             fi
@@ -161,9 +168,7 @@ mount_images() {
       create_dir "$DIR_MOUNTS/${image%.sfs}"
       insert_module loop squashfs
       mount -t squashfs -o loop,ro "$DIR_IMAGES/$image" "$DIR_MOUNTS/${image%.sfs}"
-      if [ $? -ne 0 ]; then
-        echo "error handling should come here"
-      fi
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted \"$DIR_IMAGES/$image\" at \"$DIR_MOUNTS/${image%.sfs}\""
     fi
   done
   unset seeds_blacklisted
@@ -179,9 +184,7 @@ mount_overlays() {
       lowers=$(ls "$DIR_MOUNTS" | grep -P ${mount%%-*}'(-\d+)+$' | sort -r | xargs | sed 's, ,'":$DIR_MOUNTS/"',g')
       insert_module overlay
       mount -t overlay overlay -o lowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-work $DIR_DESTINATION/${mount%%-*}
-      if [ $? -ne 0 ]; then
-        echo "error handling should come here"
-      fi
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted $DIR_DESTINATION/${mount%%-*} with options:\nlowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-work"
     fi
   done
 }
@@ -191,9 +194,7 @@ umount_images() {
   for mount in $(df | grep -Po '^/dev/loop.+'"$DIR_MOUNTS"'\K.+$'); do
     if $(mountpoint -q "$DIR_MOUNTS/$mount"); then 
       umount "$DIR_MOUNTS/$mount"
-      if [ $? -ne 0 ]; then
-        echo "error handling should come here"
-      fi
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully unmounted $DIR_MOUNTS/$mount"
     fi
   done
 }
@@ -221,9 +222,7 @@ umount_overlays() {
       esac
     #fi
     umount "$DIR_DESTINATION/$mount"
-    if [ $? -ne 0 ]; then
-      echo "error handling should come here"
-    fi
+    [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully unmounted $DIR_DESTINATION/$mount"
     #[ -d "$DIR_DESTINATION/$mount" ] && rm -rf "$DIR_DESTINATION/$mount"
     [ -d "$DIR_MOUNTS/${mount}-upper" ] && rm -rf "$DIR_MOUNTS/${mount}-upper)"
     [ -d "$DIR_MOUNTS/${mount}-work" ] && rm -rf "$DIR_MOUNTS/${mount}-work"
@@ -259,25 +258,22 @@ create_new_image() {
   fi
   NEW_ITERATION=$NEW_X-$NEW_Y
   
-  #new seed
+  # new seed
   if [ ${#NEW_X} -gt ${#OLD_X} ]; then
     for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
       echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+-\d+\.sfs)')0$(echo $image | grep -Po '\d+-\d+\.sfs')" >> "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/.images_to_rename"
     done
   fi
   
-  #new increment
+  # new increment
   if [ ${#NEW_Y} -gt ${#OLD_Y} ]; then
     for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
       echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+\.sfs)')0$(echo $image | grep -Po '\d+\.sfs')" >> "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/.images_to_rename"
     done
   fi
   mksquashfs $1 $DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/${mount}-${NEW_ITERATION}.sfs $SQUASH_FLAGS
-  if [ $? -ne 0 ]; then 
-    echo "error handling should come here"
-  fi
+  [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo -e "successfully created $DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/${mount}-${NEW_ITERATION}.sfs\nfrom: $1\nwith options: $SQUASH_FLAGS"
 }
-
 
 # if run during boot
 [ -n $EARLY_USERSPACE ] && check_available_RAM && mount_images && mount_overlays

@@ -2,12 +2,12 @@
 
 
 build() {
-    add_runscript
+  add_runscript
 }
 
 
 help() {
-    cat <<HELPEOF
-This hook should mount overlays over squashed images during boot
+  cat <<HELPEOF
+This hook mounts overlayed squashed images during boot in /
 HELPEOF
 }
