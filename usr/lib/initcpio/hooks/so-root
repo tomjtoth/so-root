@@ -2,5 +2,5 @@
 
 
 run_latehook() {
-  LD_LIBRARY_PATH=/new_root/usr/lib /new_root/usr/bin/bash /new_root/usr/bin/so-root
+  LD_LIBRARY_PATH=/new_root/usr/lib /new_root/usr/bin/bash /new_root/usr/bin/so-root --load
 }

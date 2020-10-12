@@ -1,61 +1,7 @@
 #!/bin/bash
 
 
-# required for development
-case "$1" in
-  *qcow2 )
-    case "$2" in
-      mount )
-        sudo modprobe nbd max_part=16
-        sudo qemu-nbd -c /dev/nbd0 "$1"
-        sudo partprobe /dev/nbd0
-        sudo mount /dev/nbd0p2 /mnt
-        sudo mount /dev/nbd0p1 /mnt/boot
-      ;;
-      
-      update )
-        sudo cp -a ~/soft-hard-ware/linux/bin-private/projects/so-root/* /mnt
-        #sudo arch-chroot /mnt /bin/bash -c "mkinitcpio -P && exit" #this one actually makes the image unbootable for some reason...
-      ;;
-      
-      umount )
-        sudo umount /mnt/boot
-        sudo umount /mnt
-        sudo qemu-nbd -d /dev/nbd0
-      ;;
-      
-      qemu )
-        GPU="-vga virtio"
-        #GPU="-vga virtio -display gtk,gl=on"
-        #GPU="-vga virtio -display gtk,gl=on vga=0x305"
-        #MOUSE="-usb -device usb-tablet -show-cursor"
-        #CDROM="-cdrom /home/downloads/archlinux-2020.10.01-x86_64.iso -boot order=d"
-        qemu-system-x86_64 -enable-kvm -cpu host -m 4G -hda "$1" $CDROM $GPU
-      ;;
-    esac
-    exit 0
-  ;;
-  
-  *conf )
-    [ -f "$1" ] && config_file="$1"
-  ;;
-  
-  verbosity=*)
-    verbosity=${1##*=}
-  ;;
-esac
-
-
-# if run during boot
-[ -f /init ] && [ -d /new_root ] && EARLY_USERSPACE=/new_root && PATH="/new_root/usr/bin:$PATH" && export LD_LIBRARY_PATH="/new_root/usr/lib"
-config_file=/etc/so-root.conf
-
-
-# getting config
-source $EARLY_USERSPACE$config_file
-DIR_IMAGES=$EARLY_USERSPACE$DIR_IMAGES
-DIR_MOUNTS=$EARLY_USERSPACE$DIR_MOUNTS
-DIR_DESTINATION=$EARLY_USERSPACE$DIR_DESTINATION
+### defining functions
 
 
 check_available_RAM() {
@@ -67,12 +13,12 @@ check_available_RAM() {
     read answer #</dev/tty
     case "$answer" in
       y|Y*)
-        if ! [[ $(mount /new_root 2>/dev/null | awk '{print $1}') == *zram* ]]; then
+        if ! [[ $(df /new_root | tail -n 1 | awk '{print $1}') == *zram* ]]; then
           # create zram to catch changes made to folders
           insert_module zram ext4
           zram_device=$(zramctl -f -s $(( $zram_size * 1024 * 1024 )) -a lz4)
           [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo "successfully created $zram_device"
-          DIR_MOUNTS_ZRAM=/.zram
+          IF_ZRAM="/.zram"
           mkfs.ext4 -q $zram_device
           [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo "successfully formatted $zram_device"
           create_dir "$DIR_MOUNTS/.zram"
@@ -81,11 +27,10 @@ check_available_RAM() {
         fi
         
         # create tmpfs for already compressed images
-        create_dir "$DIR_MOUNTS/.tmpfs"
+        DIR_IMAGES_TMPFS="$DIR_MOUNTS/.tmpfs"
+        create_dir "$DIR_IMAGES_TMPFS"
         size_of_images=$(( $(( $size_of_images + 5 * 1024 )) * 1024 ))
-        mount -t tmpfs tmpfs -o size=$size_of_images "$DIR_MOUNTS/.tmpfs"
-        cp $DIR_IMAGES/* $DIR_MOUNTS/.tmpfs
-        DIR_IMAGES="$DIR_MOUNTS/.tmpfs"
+        mount -t tmpfs tmpfs -o size=$size_of_images "$DIR_IMAGES_TMPFS"
       ;;
     esac
   fi
@@ -93,6 +38,7 @@ check_available_RAM() {
 
 
 create_dir() {
+  #[ -d "$1" ] && mv "$1" "${1}-$(date +%s)"
   [ -d "$1" ] && rm -rf "$1"
   mkdir -p "$1"
   [ $? -eq 0 ] && [ "$verbosity" -ge "3" ] && echo "successfully created directory $1"
@@ -138,10 +84,10 @@ mount_images() {
       # checking for multiple seeds of this image
       if $(echo $image | grep -Pq '(?<=-)0+\.sfs'); then
         seeds_available=($(ls "$DIR_IMAGES" | grep -Po "${image%%-*.sfs}"'.+0+\.sfs'))
-        if [ "${#seeds_available[@]}" -gt 1 ]; then
+        if [ "${#seeds_available[@]}" -gt "1" ]; then
           echo -e "${image%%-*.sfs} has multiple seeds as seen below\nchoose one branch to load:\n"
           for (( i=0; i<${#seeds_available[@]}; i++ )); do
-            echo "$i - ${seeds_available[$i]} - created at: $(stat $DIR_IMAGES/${seeds_available[$i]} | grep -Po '(?<=Birth: ).+')"
+            echo "$i - ${seeds_available[$i]} - created: $(stat $DIR_IMAGES/${seeds_available[$i]} | grep -Po '(?<=Modify: ).+')"  #I need "Modify" since the Birth might not translate to the tmpfs file??? will need to check this later
           done
           # choosing the branch of seed to use
           while [ : ]; do
@@ -165,10 +111,12 @@ mount_images() {
         fi
       fi
       
+      MOUNT_IMAGE_FROM="$DIR_IMAGES"
+      [ -n "$DIR_IMAGES_TMPFS" ] && cp "$DIR_IMAGES/$image" "$DIR_IMAGES_TMPFS" && MOUNT_IMAGE_FROM="$DIR_IMAGES_TMPFS"
       create_dir "$DIR_MOUNTS/${image%.sfs}"
       insert_module loop squashfs
-      mount -t squashfs -o loop,ro "$DIR_IMAGES/$image" "$DIR_MOUNTS/${image%.sfs}"
-      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted \"$DIR_IMAGES/$image\" at \"$DIR_MOUNTS/${image%.sfs}\""
+      mount -t squashfs -o loop,ro "$MOUNT_IMAGE_FROM/$image" "$DIR_MOUNTS/${image%.sfs}"
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted \"$MOUNT_IMAGE_FROM/$image\" at \"$DIR_MOUNTS/${image%.sfs}\""
     fi
   done
   unset seeds_blacklisted
@@ -177,24 +125,14 @@ mount_images() {
 
 mount_overlays() {
   for mount in $(ls "$DIR_MOUNTS" | grep -P '\w+-\d+-0+'); do
-    create_dir "$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-work"
-    create_dir "$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-upper"
+    create_dir "$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-work"
+    create_dir "$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-upper"
     create_dir "$DIR_DESTINATION/${mount%%-*}"
     if ! $(mountpoint -q "$DIR_DESTINATION/${mount%%-*}"); then 
       lowers=$(ls "$DIR_MOUNTS" | grep -P ${mount%%-*}'(-\d+)+$' | sort -r | xargs | sed 's, ,'":$DIR_MOUNTS/"',g')
       insert_module overlay
-      mount -t overlay overlay -o lowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-work $DIR_DESTINATION/${mount%%-*}
-      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted $DIR_DESTINATION/${mount%%-*} with options:\nlowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$DIR_MOUNTS_ZRAM/${mount%%-*}-work"
-    fi
-  done
-}
-
-
-umount_images() {
-  for mount in $(df | grep -Po '^/dev/loop.+'"$DIR_MOUNTS"'\K.+$'); do
-    if $(mountpoint -q "$DIR_MOUNTS/$mount"); then 
-      umount "$DIR_MOUNTS/$mount"
-      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully unmounted $DIR_MOUNTS/$mount"
+      mount -t overlay overlay -o lowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-work $DIR_DESTINATION/${mount%%-*}
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted $DIR_DESTINATION/${mount%%-*} with options:\nlowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-work"
     fi
   done
 }
@@ -202,25 +140,6 @@ umount_images() {
 
 umount_overlays() {
   for mount in $(df | grep -Po '^overlay.+'"$DIR_DESTINATION"'/\K.+$'); do
-    #if [ $(ls -A "$DIR_MOUNTS/${mount}-upper") ]; then
-      echo -e "you have unsaved changes in $mount\nyou can:\n - create a new Incremental image\n - or Seed image\n - or Delete the changes\n\nwhat will it be? [i/s/D]"
-      read saving #</dev/tty
-      case "$saving" in
-        [iI]* )
-          echo -e "\n### creating an Incremental image\n"
-          create_new_image "$DIR_MOUNTS/${mount}-upper"
-        ;;
-        
-        [sSrR]* )
-          echo -e "\n### creating a Seed image\n"
-          create_new_image "$DIR_DESTINATION/$mount"
-        ;;
-        
-        *)
-          echo -e "\n### proceeding without creating a new image\n"
-        ;;
-      esac
-    #fi
     umount "$DIR_DESTINATION/$mount"
     [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully unmounted $DIR_DESTINATION/$mount"
     #[ -d "$DIR_DESTINATION/$mount" ] && rm -rf "$DIR_DESTINATION/$mount"
@@ -230,14 +149,61 @@ umount_overlays() {
 }
 
 
+umount_images() {
+  for mount in $(df | grep -Po '^/dev/loop.+'"$DIR_MOUNTS"'/\K.+$'); do
+    if $(mountpoint -q "$DIR_MOUNTS/$mount"); then 
+      umount "$DIR_MOUNTS/$mount"
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully unmounted $DIR_MOUNTS/$mount"
+    fi
+  done
+}
+
+
+save_changes(){
+  [ -d "$DIR_MOUNTS/.zram" ] && mountpoint -q "$DIR_MOUNTS/.zram" && IF_ZRAM="/.zram"
+  for mount in $(df | grep -Po '^overlay.+'"$DIR_DESTINATION"'/\K.+$'); do
+    if [ $(ls "$DIR_MOUNTS$IF_ZRAM/${mount}-upper" | wc -l) -ge 1 ]; then
+    echo -e "you have unsaved changes in $mount\nyou can:\n - create a new Incremental image\n - or Seed image\n - or Delete the changes\n\nwhat will it be? [i/s/D]"
+    read saving #</dev/tty
+    case "$saving" in
+      [iI]*)
+        echo -e "\n### creating an Incremental image\n"
+        create_new_image "$DIR_MOUNTS$IF_ZRAM/${mount}-upper"
+      ;;
+      
+      [sSrR]*)
+        echo -e "\n### creating a Seed image\n"
+        create_new_image "$DIR_DESTINATION/$mount"
+      ;;
+      
+      *)
+        echo -e "\n### proceeding without creating a new image\n"
+      ;;
+    esac
+    fi
+  done
+}
+
+
 create_new_image() {
   required_space=$(( $(du -s "$1" | grep -Po '^\d+') / 2 ))
-  [ ! -d "$DIR_MOUNTS/persistent" ] && mkdir -p "$DIR_MOUNTS/persistent"
-  if ! $(mountpoint -q "$DIR_MOUNTS/persistent"); then
-    echo 'mount $DEV_PERSISTENT $DIR_MOUNTS/persistent' #still testing
-  fi
-  [ ! -d "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}" ] && mkdir -p "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}"
-  free_space=$(df "$DIR_MOUNTS/persistent" | tail -n 1 | awk '{print $4}')
+  
+  case "$(df $DIR_IMAGES | tail -n 1 | awk '{print $1}')" in
+    *zram*|tmpfs)
+      create_dir "$DIR_MOUNTS/persistent"
+      if ! $(mountpoint -q "$DIR_MOUNTS/persistent"); then
+        echo 'mount $DEV_PERSISTENT $DIR_MOUNTS/persistent'
+      fi
+      PERSISTENT="$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}"
+      #create_dir "$PERSISTENT" #this would effectively delete all prev images :D
+    ;;
+    
+    *)
+      PERSISTENT="$DIR_IMAGES"
+    ;;
+  esac
+  
+  free_space=$(df "$PERSISTENT" | tail -n 1 | awk '{print $4}')
   echo -e "required space: ${required_space}\nfree space: $free_space"
   if [ "$free_space" -le "$required_space" ]; then
     echo -e "there is not enough space to create an image of $1\ndeleting the changes"
@@ -245,7 +211,7 @@ create_new_image() {
   fi
   LAST_ITERATION=$(ls $DIR_IMAGES | grep -Po $mount'-\K\d+-\d+(?=\.sfs)' | tail -n 1)
   CURRENT_ITERATION=$(ls $DIR_MOUNTS | grep -Po $mount'-\K\d+-\d+' | tail -n 1)
-  if [[ "$1" == *upper ]]; then
+  if [[ $1 == *upper ]]; then
     OLD_X=${CURRENT_ITERATION%%-*}
     OLD_Y=${CURRENT_ITERATION##*-}
     NEW_X=$OLD_X
@@ -261,20 +227,125 @@ create_new_image() {
   # new seed
   if [ ${#NEW_X} -gt ${#OLD_X} ]; then
     for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
-      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+-\d+\.sfs)')0$(echo $image | grep -Po '\d+-\d+\.sfs')" >> "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/.images_to_rename"
+      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+-\d+\.sfs)')0$(echo $image | grep -Po '\d+-\d+\.sfs')" >> "$PERSISTENT/.images_to_rename"
     done
   fi
   
   # new increment
   if [ ${#NEW_Y} -gt ${#OLD_Y} ]; then
     for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
-      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+\.sfs)')0$(echo $image | grep -Po '\d+\.sfs')" >> "$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/.images_to_rename"
+      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+\.sfs)')0$(echo $image | grep -Po '\d+\.sfs')" >> "$PERSISTENT/.images_to_rename"
     done
   fi
-  mksquashfs $1 $DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/${mount}-${NEW_ITERATION}.sfs $SQUASH_FLAGS
-  [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo -e "successfully created $DIR_MOUNTS/persistent/${DIR_IMAGES##*/}/${mount}-${NEW_ITERATION}.sfs\nfrom: $1\nwith options: $SQUASH_FLAGS"
+  mksquashfs $1 "$PERSISTENT/${mount}-${NEW_ITERATION}.sfs" $SQUASH_FLAGS
+  [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo -e "successfully created $PERSISTENT/${mount}-${NEW_ITERATION}.sfs\nfrom: $1\nwith options: $SQUASH_FLAGS"
 }
 
-# if run during boot
-[ -n $EARLY_USERSPACE ] && check_available_RAM && mount_images && mount_overlays
+
+# parsing command line parameters
+CONFIG=/etc/so-root.conf
+shopt -s extglob
+while [ "$#" -gt "0" ]; do
+  case "$1" in
+    -c|--config)
+      if [ -f "$2" ]; then
+        CONFIG="$2"
+      else
+        echo "$2 does not exist, cannot source it"
+      fi
+      shift 2
+    ;;
+    
+    -q|--qemu)
+      case "$2" in
+        ?(u)mount|update)
+          QEMU="$2"
+          shift
+        ;;
+      esac
+      [ -z "$QEMU" ] && QEMU="run"
+      shift
+    ;;
+    
+    -v|--verbosity)
+      case "$2" in
+        [1-5])
+          verbosity="$2"
+          shift
+        ;;
+      esac
+      shift
+    ;;
+    
+    --?(un)load|--save)
+      MODE="${1#--}"
+      shift
+    ;;
+    
+    *)
+      echo -e "unknown flag: $1\nskipping this one"
+      shift
+    ;;
+  esac
+done
+
+
+# if running in early userspace
+[ -f /init ] && [ -d /new_root ] && EARLY_USERSPACE=/new_root && PATH="/new_root/usr/bin:$PATH" && export LD_LIBRARY_PATH="/new_root/usr/lib"
+source $EARLY_USERSPACE$CONFIG
+DIR_IMAGES=$EARLY_USERSPACE$DIR_IMAGES
+DIR_MOUNTS=$EARLY_USERSPACE$DIR_MOUNTS
+DIR_DESTINATION=$EARLY_USERSPACE$DIR_DESTINATION
+
+
+# qemu is required for testing changes made to the script
+[ -z "$QEMU_IMG" ] && QEMU_IMG=~/VMs/arch.qcow2
+case "$QEMU" in
+  mount)
+    sudo modprobe nbd max_part=16
+    sudo qemu-nbd -c /dev/nbd0 "$QEMU_IMG"
+    sudo partprobe /dev/nbd0
+    sudo mount /dev/nbd0p2 /mnt
+    sudo mount /dev/nbd0p1 /mnt/boot
+  ;;
+  
+  update)
+    sudo cp -a ~/soft-hard-ware/linux/bin-private/projects/so-root/* /mnt
+  ;;
+  
+  umount)
+    sudo umount /mnt/boot
+    sudo umount /mnt
+    sudo qemu-nbd -d /dev/nbd0
+  ;;
+  
+  run)
+    GPU="-vga virtio"
+    #GPU="-vga virtio -display gtk,gl=on"
+    #GPU="-vga virtio -display gtk,gl=on vga=0x305"
+    #MOUSE="-usb -device usb-tablet -show-cursor"
+    #CDROM="-cdrom /home/downloads/archlinux-2020.10.01-x86_64.iso -boot order=d"
+    qemu-system-x86_64 -enable-kvm -cpu host -m 4G -hda "$QEMU_IMG" $CDROM $GPU
+  ;;
+esac
+[ -n "$QEMU" ] && exit 0
+
+
+case "$MODE" in
+  load)
+    create_dir "$DIR_MOUNTS" # reseting this dir so I wouldn't need to handle different error scenarios
+    [ -n "$EARLY_USERSPACE" ] && check_available_RAM
+    mount_images
+    mount_overlays
+  ;;
+  
+  unload)
+    umount_overlays
+    umount_images
+  ;;
+  
+  save)
+    save_changes
+  ;;
+esac
 
