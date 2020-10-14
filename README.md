@@ -1,10 +1,11 @@
 # so-root = squashed and overlayed folders in /
 
-mounting squashed images read-only as loop devices and making them writeable with the help of overlayfs, providing incremental and whole image creation options (inspired by squashfu)
+mounting squashed images as read-only loop devices and making them writeable with the help of overlayfs during early userspace
+providing incremental and whole image creation options in userspace (inspired by squashfu)
 
 # this is a work in progress
 
-inspired by ramroot while waiting for the thousands of files (from ncdu: Items: 119038) to get copied during boot (using my personal setup) from a random Kingston flash drive (high seq. read, ~zero random read)
+this project was inspired by ramroot while waiting for the thousands of files to get copied during boot from a random flash drive
 
 # what works:
 - folders like /usr /var /etc /home were tested successfully
@@ -14,9 +15,6 @@ inspired by ramroot while waiting for the thousands of files (from ncdu: Items: 
    - mount - mounting my 2 partitions from the qcow2 image at /mnt
    - update - pushing updates to the image
    - umount - unmounting /mnt
- 
-# worked, might be broken currently:
-- creation of incremental and seed images require a systemd service to kick in during poweroff and be able to quistionnaire the user
 
 # how to try it:
 - create manually the squashed images-0-0.sfs under your DIR_IMAGES
@@ -30,9 +28,10 @@ inspired by ramroot while waiting for the thousands of files (from ncdu: Items: 
   - edit the DIR_DESTIONATION to "/"
   - run 'mkinitcpio -P'
   - reboot
+
 # todo:
+- rewrite the early_userspace functions for /bin/ash compatibility
 - add/remove "so-root" to/from HOOKS before fsck with sed during package installation/removal
-- automate image creation (currently doing it manually, offline)
 - create systemd unit for shutdown routines (umount_overlays(create_new_image), umount_images)
 - come up with revert solution (haven't tried yet)
 - create AUR package
