@@ -1,0 +1,114 @@
+# these functions are required for full functionality
+
+
+create_initial_images() {
+  [ ! -d "$DIR_IMAGES" ] && mkdir -p "$DIR_IMAGES"
+  for (( i=0; i<${#TARGETS[@]}; i++ )); do
+    [ ! -f "$DIR_IMAGES/${TARGETS[$i]##*/}-0-0.sfs" ] && mksquashfs "${TARGETS[$i]}" "$DIR_IMAGES/${TARGETS[$i]##*/}-0-0.sfs" $SQUASH_FLAGS && [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully created $DIR_IMAGES/${TARGETS[$i]##*/}-0-0.sfs\nfrom: ${TARGETS[$i]}\nwith options: $SQUASH_FLAGS"
+  done
+}
+
+
+save_changes() {
+  [ -d "$DIR_MOUNTS/.zram" ] && mountpoint -q "$DIR_MOUNTS/.zram" && IF_ZRAM="/.zram"
+  for mount in $(df | grep -Po '^overlay.+'"$DIR_DESTINATION"'/\K.+$'); do
+    if [ $(ls "$DIR_MOUNTS$IF_ZRAM/${mount}-upper" | wc -l) -ge 1 ]; then
+    echo -e "you have unsaved changes in $mount\nyou can:\n - create a new Incremental image\n - or Seed image\n - or Delete the changes\n\nwhat will it be? [i/s/D]"
+    read saving #</dev/tty
+    case "$saving" in
+      [iI]*)
+        echo -e "\n### creating an Incremental image\n"
+        create_new_image "$DIR_MOUNTS$IF_ZRAM/${mount}-upper"
+      ;;
+      
+      [sSrR]*)
+        echo -e "\n### creating a Seed image\n"
+        create_new_image "$DIR_DESTINATION/$mount"
+      ;;
+      
+      *)
+        echo -e "\n### proceeding without creating a new image\n"
+      ;;
+    esac
+    fi
+  done
+}
+
+
+create_new_image() {
+  required_space=$(( $(du -s "$1" | grep -Po '^\d+') / 2 ))
+  
+  case "$(df $DIR_IMAGES | tail -n 1 | awk '{print $1}')" in
+    *zram*|tmpfs)
+      create_dir "$DIR_MOUNTS/persistent"
+      if ! $(mountpoint -q "$DIR_MOUNTS/persistent"); then
+        echo 'mount $DEV_PERSISTENT $DIR_MOUNTS/persistent'
+      fi
+      PERSISTENT="$DIR_MOUNTS/persistent/${DIR_IMAGES##*/}"
+      #create_dir "$PERSISTENT" #this would effectively delete all prev images :D
+    ;;
+    
+    *)
+      PERSISTENT="$DIR_IMAGES"
+    ;;
+  esac
+  
+  free_space=$(df "$PERSISTENT" | tail -n 1 | awk '{print $4}')
+  echo -e "required space: ${required_space}\nfree space: $free_space"
+  if [ "$free_space" -le "$required_space" ]; then
+    echo -e "there is not enough space to create an image of $1\ndeleting the changes"
+    return
+  fi
+  LAST_ITERATION=$(ls $DIR_IMAGES | grep -Po $mount'-\K\d+-\d+(?=\.sfs)' | tail -n 1)
+  CURRENT_ITERATION=$(ls $DIR_MOUNTS | grep -Po $mount'-\K\d+-\d+' | tail -n 1)
+  if [[ $1 == *upper ]]; then
+    OLD_X=${CURRENT_ITERATION%%-*}
+    OLD_Y=${CURRENT_ITERATION##*-}
+    NEW_X=$OLD_X
+    NEW_Y=$(( $OLD_Y + 1))
+  else
+    OLD_X=${LAST_ITERATION%%-*}
+    OLD_Y=${LAST_ITERATION##*-}
+    NEW_X=$(( $OLD_X +1 ))
+    NEW_Y=0
+  fi
+  NEW_ITERATION=$NEW_X-$NEW_Y
+  
+  # new seed
+  if [ ${#NEW_X} -gt ${#OLD_X} ]; then
+    for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
+      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+-\d+\.sfs)')0$(echo $image | grep -Po '\d+-\d+\.sfs')" >> "$PERSISTENT/.images_to_rename"
+    done
+  fi
+  
+  # new increment
+  if [ ${#NEW_Y} -gt ${#OLD_Y} ]; then
+    for image in $(ls $DIR_IMAGES | grep -P $mount'(-\d+){2}'); do
+      echo "$DIR_IMAGES/$image..........$DIR_IMAGES/$(echo $image | grep -Po '.+(?=\d+\.sfs)')0$(echo $image | grep -Po '\d+\.sfs')" >> "$PERSISTENT/.images_to_rename"
+    done
+  fi
+  mksquashfs $1 "$PERSISTENT/${mount}-${NEW_ITERATION}.sfs" $SQUASH_FLAGS
+  [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo -e "successfully created $PERSISTENT/${mount}-${NEW_ITERATION}.sfs\nfrom: $1\nwith options: $SQUASH_FLAGS"
+}
+
+
+umount_overlays() {
+  for mount in $(df | grep -Po '^overlay.+'"$DIR_DESTINATION"'/\K.+$'); do
+    umount "$DIR_DESTINATION/$mount"
+    [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully unmounted $DIR_DESTINATION/$mount"
+    #[ -d "$DIR_DESTINATION/$mount" ] && rm -rf "$DIR_DESTINATION/$mount"
+    [ -d "$DIR_MOUNTS/${mount}-upper" ] && rm -rf "$DIR_MOUNTS/${mount}-upper)"
+    [ -d "$DIR_MOUNTS/${mount}-work" ] && rm -rf "$DIR_MOUNTS/${mount}-work"
+  done
+}
+
+
+umount_images() {
+  for mount in $(df | grep -Po '^/dev/loop.+'"$DIR_MOUNTS"'/\K.+$'); do
+    if $(mountpoint -q "$DIR_MOUNTS/$mount"); then 
+      umount "$DIR_MOUNTS/$mount"
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully unmounted $DIR_MOUNTS/$mount"
+    fi
+  done
+}
+

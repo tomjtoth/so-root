@@ -1,0 +1,133 @@
+# these functions are required during early userspace
+
+
+check_available_RAM() {
+  # this should be re-designed as now I expect the user to copy ALL possible branches to tmpfs and it's basicly at 80% capacity only
+  available_ram=$(free | grep -P 'Mem' | awk '{print $7}')
+  size_of_images=$(du -s $DIR_IMAGES | awk '{print $1}')
+  if [ "$(( $zram_size + $size_of_images * 2 + $min_system_RAM * 1024 ))" -lt "$available_ram" ]; then
+    echo -n "do you want to copy all the images to RAM? [y/N] "
+    read answer #</dev/tty
+    case "$answer" in
+      y|Y*)
+        if ! [[ $(df /new_root | tail -n 1 | awk '{print $1}') == *zram* ]]; then
+          # create zram to catch changes made to folders
+          modprobe zram ext4
+          zram_device=$(zramctl -f -s $(( $zram_size * 1024 * 1024 )) -a lz4)
+          [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo "successfully created $zram_device"
+          IF_ZRAM="/.zram"
+          mkfs.ext4 -q $zram_device
+          [ $? -eq 0 ] && [ "$verbosity" -ge "1" ] && echo "successfully formatted $zram_device"
+          create_dir "$DIR_MOUNTS/.zram"
+          mount $zram_device "$DIR_MOUNTS/.zram"
+          [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo "successfully mounted $zram_device"
+        fi
+        
+        # create tmpfs for already compressed images
+        DIR_IMAGES_TMPFS="$DIR_MOUNTS/.tmpfs"
+        create_dir "$DIR_IMAGES_TMPFS"
+        size_of_images=$(( $(( $size_of_images + 5120 )) * 1024 ))
+        mount -t tmpfs tmpfs -o size=$size_of_images "$DIR_IMAGES_TMPFS"
+      ;;
+    esac
+  fi
+}
+
+
+create_dir() {
+  if [ -d "$1" ]; then
+    if [ $(ls -A "$1" | wc -l) -ge "1" ] && [ "$2" != "delete" ]; then
+      mv "$1" "${1}.$(ls ${1%%/*} | grep -P '\b'"${1##*/}"'(.\d+)*' | wc -l)"
+    else
+      rm -rf "$1"
+    fi
+  fi
+  mkdir -p "$1"
+  [ $? -eq 0 ] && [ "$verbosity" -ge "3" ] && echo "successfully created directory $1"
+}
+
+
+
+mount_images() {
+  # renaming images if necessary
+  if [ -f "$DIR_IMAGES/.images_to_rename" ]; then
+    for line in $(cat "$DIR_IMAGES/.images_to_rename"); do
+      SRC=$(echo $line | grep -Po '^.+(?=\.{10})')
+      DST=$(echo $line | grep -Po '(?<=\.{10}).+$')
+      if [ -f "$SRC" ] && [ ! -e "$DST" ]; then
+        mv "$EARLY_USERSPACE$SRC" "$EARLY_USERSPACE$DST"
+        [ $? -eq 0 ] && [ "$verbosity" -ge "4" ] && echo -e "successfully renamed \"$EARLY_USERSPACE$SRC\" to \"$EARLY_USERSPACE$DST\""
+      fi
+    done
+    rm "$DIR_IMAGES/.images_to_rename"
+  fi
+  
+  for image in $(ls "$DIR_IMAGES" | grep -P 'sfs'); do
+    if ! $(mountpoint -q "$DIR_MOUNTS/${image%.sfs}"); then 
+      
+      # skipping checking the seed if it's blacklisted
+      if [ -n "$seeds_blacklisted" ]; then
+        for (( i=0; i<${#seeds_blacklisted[@]}; i++ )); do
+          if $(echo $image | grep -Pq ${seeds_blacklisted[$i]}); then
+            continue 2
+          fi
+        done
+      fi
+      
+      # checking for multiple seeds of this image
+      if $(echo $image | grep -Pq '(?<=-)0+\.sfs'); then
+        seeds_available=($(ls "$DIR_IMAGES" | grep -Po "${image%%-*.sfs}"'.+0+\.sfs'))
+        if [ "${#seeds_available[@]}" -gt "1" ]; then
+          echo -e "${image%%-*.sfs} has multiple seeds as seen below:\n"
+          for (( i=0; i<${#seeds_available[@]}; i++ )); do
+            echo "$i - ${seeds_available[$i]} - created: $(stat $DIR_IMAGES/${seeds_available[$i]} | grep -Po '(?<=Modify: ).+')"  #I need "Modify" since the Birth might not translate to the tmpfs file??? will need to check this later
+          done
+          echo -n -e "\nchoose one branch to load [0-$(( ${#seeds_available[@]} - 1 ))]: "
+          
+          # choosing the branch of seed to use
+          while [ : ]; do
+            read seed #</dev/tty
+            regex='^[0-9]+$'
+            # defaulting to the last one
+            [ -z $seed ] && seed=$(( ${#seeds_available[@]} - 1 ))
+            if ! [[ $seed =~ $regex ]] || [ "$seed" -lt 0 ] || [ "$seed" -gt "$(( ${#seeds_available[@]} - 1 ))" ] ; then
+              echo "not a valid choice"
+            else
+              # blacklist all images containing the non-selected seeds
+              for (( i=0; i<${#seeds_available[@]}; i++ )); do
+                [ "$i" -eq "$seed" ] && continue
+                seeds_blacklisted+=($(echo "${seeds_available[$i]}" | grep -Po '.+(?=-\d+\.sfs)'))
+                [ "$verbosity" -ge "5" ] && echo -e "### these are the currently blacklisted seeds:\n${seeds_blacklisted[@]}"
+                image=${seeds_available[$seed]}
+              done
+              break
+            fi
+          done
+        fi
+      fi
+      
+      
+      MOUNT_IMAGE_FROM="$DIR_IMAGES"
+      [ -n "$DIR_IMAGES_TMPFS" ] && cp "$DIR_IMAGES/$image" "$DIR_IMAGES_TMPFS" && MOUNT_IMAGE_FROM="$DIR_IMAGES_TMPFS"
+      create_dir "$DIR_MOUNTS/${image%.sfs}"
+      modprobe loop squashfs
+      mount -t squashfs -o loop,ro "$MOUNT_IMAGE_FROM/$image" "$DIR_MOUNTS/${image%.sfs}"
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted \"$MOUNT_IMAGE_FROM/$image\" at \"$DIR_MOUNTS/${image%.sfs}\""
+    fi
+  done
+}
+
+
+mount_overlays() {
+  for mount in $(df | grep -Po '^/dev/loop.+'"$DIR_MOUNTS"'/\K.+(?=-\d+-0+)'); do
+    create_dir "$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-work"
+    create_dir "$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-upper"
+    create_dir "$DIR_DESTINATION/${mount%%-*}"
+    if ! $(mountpoint -q "$DIR_DESTINATION/${mount%%-*}"); then 
+      lowers=$(ls "$DIR_MOUNTS" | grep -P ${mount%%-*}'(-\d+)+$' | sort -r | xargs | sed 's, ,'":$DIR_MOUNTS/"',g')
+      modprobe overlay
+      mount -t overlay overlay -o lowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-work $DIR_DESTINATION/${mount%%-*}
+      [ $? -eq 0 ] && [ "$verbosity" -ge "2" ] && echo -e "successfully mounted $DIR_DESTINATION/${mount%%-*} with options:\nlowerdir=$DIR_MOUNTS/$lowers,upperdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-upper,workdir=$DIR_MOUNTS$IF_ZRAM/${mount%%-*}-work"
+    fi
+  done
+}

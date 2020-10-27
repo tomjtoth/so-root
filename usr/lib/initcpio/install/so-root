@@ -3,6 +3,19 @@
 
 build() {
   add_runscript
+  add_binary xargs
+  add_binary grep
+  add_binary bash
+  add_binary zramctl
+  add_binary so-root
+  add_binary mkfs.ext4
+  add_file /etc/so-root.conf
+  add_file /usr/lib/so-root/early_userspace
+  add_module lz4
+  add_module zram
+  add_module loop
+  add_module squashfs
+  add_module overlay
 }
 
 
