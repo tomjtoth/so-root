@@ -10,17 +10,15 @@ this project was inspired by ramroot while waiting for the thousands of files to
 # what works:
 - folders like /usr /var /etc /home were tested successfully
 - config file in /etc/so-root.conf
-- $1 can be "/path/to/custom/*.conf" - sourcing that instead of the default config file
-- $1 can be "/path/to/something.qcow2"
-   - mount - mounting my 2 partitions from the qcow2 image at /mnt
-   - update - pushing updates to the image
-   - umount - unmounting /mnt
+- saving the state of the upper folders on user request
+- some test functions
 
 # how to try it:
-- create manually the squashed images-0-0.sfs under your DIR_IMAGES
+- copy the files in place
+- run 'so-root --enable'
+- include "keymap" and "so-root" in your HOOKS
 - make a test-run:
   - set DIR_DESTINATION of something else than "/"
-  - include so-root in your HOOKS
   - run 'mkinitcpio -P'
   - reboot
   - verify with 'mount', lower,upper,workdirs include the tag /new_root in their path, but they do function properly in userspace
