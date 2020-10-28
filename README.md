@@ -2,17 +2,15 @@
 
 mounting squashed images as read-only loop devices and making them writeable with the help of overlayfs during early userspace providing incremental and whole image creation options in userspace (inspired by squashfu)
 
-# this is a work abandoned before completed
+# at least I learnt a bit on how the Arch boot process works
 
-this project was inspired by ramroot while waiting for the thousands of files to get copied during boot from a random flash drive
+this is a failed project, inspired by ramroot while waiting for the thousands of files to get copied during boot from a random flash drive
 
-how it failed:
-during boot I moved the the lz4 compressed images to tmpfs (should be faster than zram, right?)
-mounted the images to $DIR_MOUNTS
-created the work and upper directories on a zram device which also uses lz4 compression
-mounted the merged directories under /usr /etc /var /home
-
-the result feels much less responsive than ramroot, let me know if you have better results :D
+- during boot I moved the the lz4 compressed images to tmpfs (should be faster than zram, right?)
+- mounted the images to $DIR_MOUNTS
+- created the work and upper directories on a zram device which also uses lz4 compression
+- mounted the merged directories under /usr /etc /var /home
+- the result feels much less responsive than ramroot, let me know if you have better results :D
 
 # what works:
 - folders like /usr /var /etc /home were tested successfully
